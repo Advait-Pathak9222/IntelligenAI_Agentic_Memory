@@ -495,6 +495,145 @@ class ProductionMemoryStressTests(unittest.TestCase):
             bench.close()
             bench_dir.cleanup()
 
+    def test_ten_os_worker_processes_concurrent_sqlite_wal(self) -> None:
+        import multiprocessing as mp
+
+        # Seed 1 shared claim for a 10-process simultaneous CAS race, plus 50 staged write jobs
+        self.layer.stage_run_claims(
+            org_id="org_mp",
+            run_id="seed_run",
+            candidates=[
+                CandidateClaim(
+                    entity_key="org_mp:shared_target",
+                    text="Shared CAS target claim",
+                    source_step_ids=["probe"],
+                )
+            ],
+            tool_logs={"probe": TrustTier.T1_VERIFIED},
+        )
+        self.layer.worker.drain_once(now=self.now)
+        seed_claim = self.layer.repo.find_active_by_entity("org_mp", "org_mp:shared_target")
+        self.assertIsNotNone(seed_claim)
+
+        for i in range(50):
+            variant = "stable config v1" if i % 3 != 0 else f"conflicting config v{i}"
+            self.layer.stage_run_claims(
+                org_id="org_mp",
+                run_id=f"mp_job_{i}",
+                candidates=[
+                    CandidateClaim(
+                        entity_key=f"org_mp:key_{i % 5}",
+                        text=variant,
+                        source_step_ids=["probe"],
+                    )
+                ],
+                tool_logs={"probe": TrustTier.T1_VERIFIED},
+            )
+
+        ctx = mp.get_context("spawn")
+        barrier = ctx.Barrier(10)
+        result_q = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=_mp_worker_task,
+                args=(self.db_path, seed_claim.id, seed_claim.version, barrier, result_q),
+            )
+            for _ in range(10)
+        ]
+        for p in procs:
+            p.start()
+        for p in procs:
+            p.join(timeout=30)
+            self.assertEqual(p.exitcode, 0, f"Worker process exited with code {p.exitcode}")
+
+        results = [result_q.get(timeout=5) for _ in range(10)]
+        errors = [r["error"] for r in results if r["error"] is not None]
+        self.assertEqual(errors, [], f"Worker errors observed: {errors}")
+
+        # Exactly 1 of the 10 racing OS processes should win the initial CAS race; 9 must catch CAS conflict
+        cas_wins = sum(1 for r in results if r["cas_won"])
+        cas_conflicts = sum(1 for r in results if r["cas_conflict"])
+        self.assertEqual(cas_wins, 1)
+        self.assertEqual(cas_conflicts, 9)
+
+        # Every enqueued job must be executed exactly once (zero duplicates, zero remaining PENDING)
+        total_jobs_handled = sum(r["jobs_handled"] for r in results)
+        self.assertGreaterEqual(total_jobs_handled, 50)
+        remaining_pending = self.layer.repo.conn.execute(
+            "SELECT COUNT(*) FROM async_jobs WHERE status != 'DONE'"
+        ).fetchone()[0]
+        self.assertEqual(remaining_pending, 0)
+
+        # Every worker process must be able to recall newly committed claims via data_version sync
+        self.assertTrue(all(r["recalled_count"] >= 1 for r in results))
+
+        # No entity_key may end up with >1 ACTIVE claim across concurrent inserts
+        dup_rows = self.layer.repo.conn.execute(
+            """
+            SELECT entity_key, COUNT(*) AS cnt
+            FROM claims
+            WHERE org_id = 'org_mp' AND status = 'ACTIVE'
+            GROUP BY entity_key
+            HAVING cnt > 1
+            """
+        ).fetchall()
+        self.assertEqual(len(dup_rows), 0)
+
+
+def _mp_worker_task(
+    db_path: str,
+    seed_claim_id: str,
+    seed_version: int,
+    barrier,
+    result_q,
+) -> None:
+    """Spawned OS worker process testing CAS race + atomic job claiming + gentle pacing."""
+    layer = AgentMemoryLayer(db_path=db_path)
+    cas_won = False
+    cas_conflict = False
+    jobs_handled = 0
+    recalled_count = 0
+    error_msg = None
+    try:
+        barrier.wait(timeout=15)
+
+        # 1. Simultaneous 10-process CAS race on the exact same Claim version
+        claim = layer.repo.get_claim(seed_claim_id)
+        if claim is not None:
+            claim.pos += 1
+            try:
+                layer.repo.update_claim_cas(claim, expected_version=seed_version)
+                cas_won = True
+            except ConcurrencyConflictError:
+                cas_conflict = True
+
+        # 2. Gently drain queued jobs across all 10 processes without overheating CPU
+        for _ in range(30):
+            handled = layer.worker.drain_once()
+            jobs_handled += handled
+            if handled == 0:
+                pending = layer.repo.conn.execute(
+                    "SELECT COUNT(*) FROM async_jobs WHERE status = 'PENDING'"
+                ).fetchone()[0]
+                if pending == 0:
+                    break
+            time.sleep(0.01)
+
+        recalled_count = len(layer.recall("org_mp", "stable config key_0"))
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+    finally:
+        layer.close()
+        result_q.put(
+            {
+                "cas_won": cas_won,
+                "cas_conflict": cas_conflict,
+                "jobs_handled": jobs_handled,
+                "recalled_count": recalled_count,
+                "error": error_msg,
+            }
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -61,6 +61,7 @@ class AgentMemoryLayer:
     ) -> List[RecalledClaim]:
         """Zero-LLM critical-path hybrid recall (BM25 + vector + 1-hop graph) packed <= 4k tokens."""
         now = now or utc_now()
+        self.repo.sync_vector_cache()
         bm25_hits = bm25_search_sqlite(self.repo.conn, org_id=org_id, query_text=query_text, limit=50)
         q_vec = self.embedder.embed(query_text)
         vec_hits = self.repo.vector_index.search([org_id, "GLOBAL"], q_vec, top_k=50)

@@ -80,7 +80,7 @@ pip install -r requirements.txt
 # 1. Regenerate the submission PDF and run the word-count audit
 python3 build/generate_pdf.py
 
-# 2. Run the full compliance and production stress-test suite (10 tests)
+# 2. Run the full compliance and production stress-test suite (11 tests)
 python3 -m unittest tests/stress_test.py -v
 ```
 
@@ -92,7 +92,7 @@ python3 -m unittest tests/stress_test.py -v
 4. **Scenario 2 (Planted Memory):** `20` repeated `T3` Sybil tickets and summarization laundering attempts stay `QUARANTINED` and blocked at the outbound email sink-gate, while `T0` confirmation promotes valid updates.
 5. **Scenario 3 (Compounding Error):** Delayed feedback triggers async attribution and bidirectional `DERIVED_FROM` rollback, retracting root `C_utc`, quarantining all `14` single-support derived claims, and preserving `T1`-backed claims with penalized confidence.
 6. **Scenario 4 (Cross-Tenant Isolation):** Zero org-to-org leakage; public OSS bug patterns stay private at `9` orgs and promote to `global` at `k >= 10` (`30` orgs) with org identifiers scrubbed.
-7. **Async Worker, CAS & Scale:** Background `asyncio` worker loop, SQLite optimistic CAS mismatch rejection, Ebbinghaus `10,000/org` capping (protecting `T0`), and multi-tenant critical-path latency + batched LLM budget checks.
+7. **10-Process OS Concurrency & Scale:** `10` spawned OS worker processes racing simultaneously on SQLite WAL (`BEGIN IMMEDIATE` + `UPDATE ... RETURNING *` job claims, `PRAGMA data_version` vector cache sync, `1` CAS winner / `9` CAS conflicts, `0` duplicate active entity claims), plus `asyncio` worker loop, Ebbinghaus `10,000/org` capping, and critical-path latency + batched LLM budget checks.
 
 ## Known Trade-Offs
 

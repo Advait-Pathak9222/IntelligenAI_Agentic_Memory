@@ -127,24 +127,8 @@ class SleepTimeWorker:
         user_id = payload.get("user_id")
         sig = payload.get("public_artifact_signature")
 
-        existing = self.repo.find_active_by_entity(org_id, entity_key)
-        if existing is not None and existing.text == text and existing.trust_tier <= tier:
-            existing.pos += 1
-            existing.last_used = now
-            existing.uses += 1
-            try:
-                self.repo.update_claim_cas(existing, expected_version=existing.version)
-            except ConcurrencyConflictError:
-                refreshed = self.repo.get_claim(existing.id)
-                if refreshed is not None:
-                    refreshed.pos += 1
-                    refreshed.last_used = now
-                    refreshed.uses += 1
-                    self.repo.update_claim_cas(refreshed, expected_version=refreshed.version)
-            return
-
         vec = self.repo.embedder.embed(f"{entity_key} {text}")
-        claim = Claim(
+        candidate = Claim(
             org_id=org_id,
             user_id=user_id,
             scope=scope,
@@ -158,18 +142,21 @@ class SleepTimeWorker:
             run_id=run_id,
             last_used=now,
         )
-        self.repo.insert_claim(claim, vec=vec)
-        for pid in parent_ids:
-            self.repo.add_edge(pid, claim.id, EdgeType.DERIVED_FROM)
+        outcome, committed, collision_id = self.repo.commit_or_corroborate_atomic(
+            claim=candidate, vec=vec, parent_ids=parent_ids, now=now
+        )
+        if outcome == "CORROBORATED":
+            return
 
         # Collision detection: exact entity_key mismatch OR high vector similarity > 0.82
         collision_ids: List[str] = []
-        if existing is not None and existing.id != claim.id and existing.text != text:
-            collision_ids.append(existing.id)
+        if collision_id is not None:
+            collision_ids.append(collision_id)
         else:
+            self.repo.sync_vector_cache()
             sim_hits = self.repo.vector_index.search([org_id], vec, top_k=5)
             for hit_id, sim in sim_hits.items():
-                if hit_id != claim.id and sim > self.similarity_conflict_threshold:
+                if hit_id != committed.id and sim > self.similarity_conflict_threshold:
                     hit_claim = self.repo.get_claim(hit_id)
                     if hit_claim is not None and hit_claim.text != text:
                         collision_ids.append(hit_id)
@@ -179,7 +166,7 @@ class SleepTimeWorker:
             self.repo.enqueue_job(
                 JobType.RESOLVE_CONFLICT,
                 org_id,
-                {"existing_id": collision_ids[0], "candidate_id": claim.id},
+                {"existing_id": collision_ids[0], "candidate_id": committed.id},
             )
 
         if sig:
@@ -202,43 +189,50 @@ class SleepTimeWorker:
 
         decisions = self.judge.batched_revise_conflicts(pairs)
         for dec in decisions:
-            old = self.repo.get_claim(dec.existing_id)
-            new = self.repo.get_claim(dec.candidate_id)
-            if old is None or new is None:
-                continue
+            for _ in range(3):
+                old = self.repo.get_claim(dec.existing_id)
+                new = self.repo.get_claim(dec.candidate_id)
+                if old is None or new is None:
+                    break
+                try:
+                    if dec.action == RevisionAction.REJECT:
+                        new.status = ClaimStatus.RETRACTED
+                        self.repo.update_claim_cas(new, expected_version=new.version)
+                        break
 
-            if dec.action == RevisionAction.REJECT:
-                new.status = ClaimStatus.RETRACTED
-                self.repo.update_claim_cas(new, expected_version=new.version)
-                continue
+                    # Cross-tier IFC invariant: T3 may contest T0-T2, never silently supersede it
+                    if (
+                        new.trust_tier == TrustTier.T3_UNTRUSTED
+                        and old.trust_tier < TrustTier.T3_UNTRUSTED
+                    ):
+                        old.status = ClaimStatus.CONTESTED
+                        old.neg += 1
+                        self.repo.update_claim_cas(old, expected_version=old.version)
+                        new.status = ClaimStatus.QUARANTINED
+                        self.repo.update_claim_cas(new, expected_version=new.version)
+                        self.repo.add_edge(old.id, new.id, EdgeType.CONTESTED_BY)
+                        break
 
-            # Cross-tier IFC invariant: T3 may contest T0-T2, never silently supersede it
-            if new.trust_tier == TrustTier.T3_UNTRUSTED and old.trust_tier < TrustTier.T3_UNTRUSTED:
-                old.status = ClaimStatus.CONTESTED
-                old.neg += 1
-                self.repo.update_claim_cas(old, expected_version=old.version)
-                new.status = ClaimStatus.QUARANTINED
-                self.repo.update_claim_cas(new, expected_version=new.version)
-                self.repo.add_edge(old.id, new.id, EdgeType.CONTESTED_BY)
-                continue
-
-            if dec.action == RevisionAction.SUPERSEDE:
-                old.status = ClaimStatus.SUPERSEDED
-                old.valid_to = now
-                self.repo.update_claim_cas(old, expected_version=old.version)
-                new.status = ClaimStatus.ACTIVE
-                self.repo.update_claim_cas(new, expected_version=new.version)
-                self.repo.add_edge(new.id, old.id, EdgeType.SUPERSEDES)
-            elif dec.action == RevisionAction.COEXIST:
-                if dec.split_entity_key:
-                    new.entity_key = dec.split_entity_key
-                new.status = ClaimStatus.ACTIVE
-                self.repo.update_claim_cas(new, expected_version=new.version)
-            elif dec.action == RevisionAction.CONFIRM:
-                old.pos += 1
-                self.repo.update_claim_cas(old, expected_version=old.version)
-                new.status = ClaimStatus.SUPERSEDED
-                self.repo.update_claim_cas(new, expected_version=new.version)
+                    if dec.action == RevisionAction.SUPERSEDE:
+                        self.repo.supersede_and_activate_atomic(
+                            new_claim_id=new.id, fallback_old_id=old.id, now=now
+                        )
+                        break
+                    if dec.action == RevisionAction.COEXIST:
+                        if dec.split_entity_key:
+                            new.entity_key = dec.split_entity_key
+                        new.status = ClaimStatus.ACTIVE
+                        self.repo.update_claim_cas(new, expected_version=new.version)
+                        break
+                    if dec.action == RevisionAction.CONFIRM:
+                        old.pos += 1
+                        self.repo.update_claim_cas(old, expected_version=old.version)
+                        new.status = ClaimStatus.SUPERSEDED
+                        self.repo.update_claim_cas(new, expected_version=new.version)
+                        break
+                    break
+                except ConcurrencyConflictError:
+                    continue
 
     def _handle_feedback_rollback(self, payload: dict) -> Set[str]:
         recalled_ids: List[str] = payload.get("recalled_claim_ids", [])
