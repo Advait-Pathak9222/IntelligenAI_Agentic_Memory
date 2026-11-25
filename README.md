@@ -54,37 +54,47 @@ The design separates a deterministic **Hot Path** (`0` LLM calls, `<= 150 ms` p9
 .
 ├── Agentic_Memory_Architecture_Submission.pdf   # Final <= 1,200-word submission PDF (with 2 SVG diagrams)
 ├── INTERVIEW_STUDY_GUIDE.md                     # Architecture defense guide, whiteboard math & Q&A
+├── requirements.txt                             # Minimal runtime dependencies (numpy, httpx)
 ├── build/
 │   ├── generate_pdf.py                          # HTML + SVG -> PDF builder and strict word-count auditor
 │   └── submission.html                          # Rendered HTML source
 ├── src/
-│   └── epistemic_memory.py                      # Minimal zero-dependency Python reference model
+│   ├── __init__.py                              # Public package exports
+│   ├── models.py                                # Claim, CandidateClaim, TrustTier, ClaimStatus, EdgeType
+│   ├── indexes.py                               # SQLite FTS5 BM25, NumPy VectorIndex, Hashing/OpenAI embedders
+│   ├── storage.py                               # SQLite WAL ClaimRepository, graph edges, CAS, async_jobs queue
+│   ├── llm_adapters.py                          # Pluggable batched LLMJudge (OpenAI-compatible + local heuristic)
+│   ├── worker.py                                # Async SleepTimeWorker (5:1 conflict batching, JTMS, decay)
+│   └── memory_layer.py                          # AgentMemoryLayer hot-path recall & non-blocking staging API
 └── tests/
-    └── stress_test.py                           # Compliance, adversarial scenario & 5k-run scale tests
+    └── stress_test.py                           # Compliance, SQLite WAL persistence, async & scale tests
 ```
 
 ## Verification & Stress Tests
 
-Requires Python 3.10+ (standard library only for the reference engine and tests; Google Chrome for PDF regeneration).
+Requires Python 3.10+, `numpy`, `httpx` (and Google Chrome for PDF regeneration).
 
 ```bash
+pip install -r requirements.txt
+
 # 1. Regenerate the submission PDF and run the word-count audit
 python3 build/generate_pdf.py
 
-# 2. Run the full compliance and adversarial stress-test suite (10 tests)
+# 2. Run the full compliance and production stress-test suite (10 tests)
 python3 -m unittest tests/stress_test.py -v
 ```
 
 ### What `tests/stress_test.py` Verifies
 
 1. **Submission Compliance:** Exact 6 headings in order, per-section and total (`1,157 <= 1,200`) word limits, XML-valid SVG diagrams (`<= 2`), and zero unexpected attribution tokens.
-2. **Scenario 1 (Staleness):** `T3` Postgres-16 error contests `T1` Postgres-14 via `CONTESTED_BY` without silent overwrite; verified `T1` check closes `valid_to` and activates Postgres 16.
-3. **Scenario 2 (Planted Memory):** `25` repeated `T3` Sybil tickets and summarization laundering attempts stay `QUARANTINED` and blocked at the outbound email sink-gate, while `T0` confirmation promotes valid updates.
-4. **Scenario 3 (Compounding Error):** Multi-hop `DERIVED_FROM` rollback triggered from a downstream leaf quarantines all `14` single-support derived claims while preserving `T1`-backed claims with penalized confidence.
-5. **Scenario 4 (Cross-Tenant Isolation):** Zero org-to-org leakage; public OSS bug patterns stay private at `9` orgs and promote to `global` at `k >= 10` (`30` orgs).
-6. **Concurrency, Forgetting & Scale:** Optimistic CAS mismatch rejection, Ebbinghaus `10,000/org` capping (protecting `T0`), `4,000`-token recall packing, `task`-scratch rejection, and a `5,000`-run / `200`-org simulation under budget.
+2. **Persisted Hybrid Recall:** SQLite FTS5 BM25 + NumPy dense vector scores persist across database close/reopen and render `[id]`-tagged context blocks.
+3. **Scenario 1 (Staleness):** `T3` Postgres-16 error contests `T1` Postgres-14 via `CONTESTED_BY` without silent overwrite; `T1` verification closes `valid_to`, activates Postgres 16, and writes a `SUPERSEDES` edge.
+4. **Scenario 2 (Planted Memory):** `20` repeated `T3` Sybil tickets and summarization laundering attempts stay `QUARANTINED` and blocked at the outbound email sink-gate, while `T0` confirmation promotes valid updates.
+5. **Scenario 3 (Compounding Error):** Delayed feedback triggers async attribution and bidirectional `DERIVED_FROM` rollback, retracting root `C_utc`, quarantining all `14` single-support derived claims, and preserving `T1`-backed claims with penalized confidence.
+6. **Scenario 4 (Cross-Tenant Isolation):** Zero org-to-org leakage; public OSS bug patterns stay private at `9` orgs and promote to `global` at `k >= 10` (`30` orgs) with org identifiers scrubbed.
+7. **Async Worker, CAS & Scale:** Background `asyncio` worker loop, SQLite optimistic CAS mismatch rejection, Ebbinghaus `10,000/org` capping (protecting `T0`), and multi-tenant critical-path latency + batched LLM budget checks.
 
 ## Known Trade-Offs
 
 * **Silent `T1` Semantic Misreads:** If an internal `T1` tool returns valid JSON with ambiguous values (e.g., `04/05/2026`) and zero tool errors, repeated runs corroborate the wrong interpretation until a 2% human flag triggers DAG rollback. Catching silent semantic misreads per run would require a ground-truth oracle or per-read LLM audit, breaking both the `2.0` LLM-call and `300 ms` latency caps.
-* **Single-Process Reference Model:** `src/epistemic_memory.py` models the provenance DAG, CAS versioning, IFC gates, and JTMS rollback deterministically in memory using Python's standard library rather than binding to a specific external vector or graph database.
+* **Single-Node Storage Backend:** `ClaimRepository` uses SQLite WAL + FTS5 + in-process NumPy vector matrices + a durable `async_jobs` table so the entire production architecture runs locally with zero external infrastructure; swapping in Qdrant/pgvector, Redis Streams, or Neo4j requires implementing the same repository/index interfaces.
