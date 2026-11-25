@@ -1,42 +1,90 @@
 # Epistemic Provenance Graph — Agentic Memory for Headless Agents
 
-Architecture submission, reference implementation, and automated stress-test suite for designing persistent, self-correcting memory for unsupervised headless AI agents.
+Architecture specification, minimal reference engine, and automated stress-test suite for persistent memory in unsupervised, multi-tenant headless AI agents.
 
-## Core Design
+## Problem Constraints
 
-Every stored memory is modeled as a **taint-labeled, bi-temporal Claim node** inside an org-partitioned **Provenance DAG** (`DERIVED_FROM`, `CONTESTED_BY`, and `SUPERSEDES` edges):
+A headless agent runs without human supervision on a task queue, making memory an **epistemic belief-maintenance problem** rather than a pure retrieval problem:
 
-- **Hot Path (0 LLM calls, <=150 ms p95):** Zero-LLM hybrid recall (BM25 + vector + 1-hop graph) packs `ACTIVE` and `CONTESTED` claims within a 4,000-token context cap, while run-end output schemas stage `<=3` candidate claims referencing `source_step_ids` and `derived_from[]`.
-- **IFC Trust & Quarantine:** Four integrity tiers (`T0_HUMAN > T1_VERIFIED > T2_INFERRED > T3_UNTRUSTED`) enforce strict non-amplification (`trust_tier(child) = min_trust(parents)`). External `T3` claims start `QUARANTINED` and cannot silently overwrite higher-tier beliefs or authorize outbound external actions.
-- **Sleep-Time Batch Lane (~0.08–0.30 LLM calls/run avg):** Exact corroborations increment evidence counts with zero LLM calls; entity collisions and semantic conflicts trigger batched sleep-time revision (`5 pairs/call`).
-- **Bidirectional JTMS Rollback:** When delayed 2% human feedback flags a report, the graph walks `DERIVED_FROM` backward to unverified `T2`/`T3` roots and forward across all dependents to quarantine every unsupported downstream memory deterministically.
-- **Cross-Tenant Safety & Bounded Lifetime:** Org data stays partitioned by `org_id`. Only PII-scrubbed public-artifact patterns seen independently by `k >= 10` orgs promote to `global` playbooks. Nightly Ebbinghaus pruning caps active claims at `10,000/org`.
+| Dimension | Constraint |
+|---|---|
+| **Throughput & Orgs** | ~5,000 runs/day across 200 strictly isolated customer organizations (2–50 tool calls/run) |
+| **Feedback Sparsity** | ~2% of outputs receive human feedback, arriving days later; 98% receive none |
+| **Untrusted Inputs** | External emails, web pages, uploads, and support tickets may contain planted instructions |
+| **Context & Lifetime** | <= 4,000 tokens of memory per step; bounded storage over 2+ years |
+| **Latency & Cost Caps** | <= 300 ms p95 added to the critical path; <= 2 extra LLM calls/run on average (including background jobs) |
+| **Model Constraint** | Black-box LLM only; no fine-tuning or weight updates |
+
+## Architecture Overview
+
+The design separates a deterministic **Hot Path** (`0` LLM calls, `<= 150 ms` p95) from an asynchronous **Sleep-Time Batch Lane** (`~0.08–0.30` LLM calls/run avg). Every memory is stored as one structured **`Claim`** node inside an org-partitioned **Provenance DAG** linked by `DERIVED_FROM`, `CONTESTED_BY`, and `SUPERSEDES` edges.
+
+### 1. Unified Data Model (`Claim`)
+
+| Field | Role |
+|---|---|
+| `id, org_id, scope` | UUID, hard tenant partition key, and scope (`task` \| `user` \| `org` \| `global`) |
+| `entity_key, text` | Normalized subject key (e.g., `acme:prod_db`) and atomic claim (`<= 40` tokens) |
+| `trust_tier` | Information-Flow Control (IFC) integrity: `T0_HUMAN > T1_VERIFIED > T2_INFERRED > T3_UNTRUSTED` |
+| `status, pos, neg` | `QUARANTINED \| ACTIVE \| CONTESTED \| SUPERSEDED \| RETRACTED`; confidence `(pos + 1) / (pos + neg + 2)` |
+| `valid_from, valid_to` | Bi-temporal validity window (closed on supersession instead of destructive overwrite) |
+| `derived_from[], run_id` | Cited parent claim IDs and origin run for causal rollback; `version` (CAS) and `last_used` for decay |
+
+### 2. Core Mechanisms
+
+* **Zero-LLM Critical Path (Recall & Write Staging):** Hybrid BM25 + vector + 1-hop graph lookup scores `ACTIVE` and `CONTESTED` claims by `sim * confidence * exp(-0.02 * days)` and packs `<= 4,000` tokens tagged `[id]`. At run end, the agent's final output schema stages `<= 3` candidate claims citing `source_step_ids` and `derived_from[]`. Raw transcripts, `task` scratch, and ungrounded claims are dropped.
+* **Non-Amplifying IFC Quarantine Gate:** Child trust is bounded by `min_trust(tool_logs, parents)` so LLM summarization never launders untrusted ticket/email text into trusted beliefs. `T3_UNTRUSTED` claims start `QUARANTINED`, cannot drive outbound actions, and may only attach a `CONTESTED_BY` edge to `T0–T2` claims rather than silently overwriting them.
+* **Optimistic Concurrency & Batched Revision:** Commits enforce optimistic CAS (`version`) per `(org_id, entity_key)`. Exact matches increment `pos` with `0` LLM calls; collisions or contradicting `T1` tool errors queue a batched sleep-time LLM judge (`5 pairs/call`) returning `CONFIRM`, `SUPERSEDE`, `COEXIST`, or `REJECT`.
+* **Bidirectional JTMS Error Containment:** When delayed 2% human feedback flags a report, `1` async LLM call attributes the fault among recalled claims. A deterministic graph walk traces `DERIVED_FROM` backward to unverified `T2`/`T3` roots (`RETRACTED`) and forward across all descendants, quarantining any claim lacking independent `T0`/`T1` support (`0` LLM calls).
+* **Cross-Tenant Safety & Bounded Forgetting:** Tenant claims never leave `org_id`. Only PII-scrubbed public-artifact patterns independently observed across `k >= 10` orgs promote to `global` procedural playbooks with zero org links. Nightly Ebbinghaus pruning caps active claims at `10,000/org` and compacts `SUPERSEDED`/`RETRACTED` leaf nodes older than 90 days.
+
+### 3. Cost & Latency Budget (5,000 Runs/Day)
+
+| Workload | LLM Calls / Day | Critical-Path Latency |
+|---|---|---|
+| Hot-path recall & run-end write staging | `0` | `~70 ms` median / `<= 150 ms` p95 |
+| Batched collision & staleness checks (~1,250/day, 5:1) | `~250` | `0 ms` (async) |
+| Delayed 2% human feedback attribution (100/day) | `~100` | `0 ms` (async) |
+| Global `k`-anonymous distillation & nightly merges | `~50` | `0 ms` (async) |
+| **Total** | **`~400/day` (`0.08/run` avg)** | **`<= 150 ms` p95 (cap: `300 ms`)** |
 
 ## Repository Structure
 
 ```text
 .
-├── Agentic_Memory_Architecture_Submission.pdf   # Final <=1,200-word submission PDF (with 2 diagrams)
-├── INTERVIEW_STUDY_GUIDE.md                     # Architecture defense guide & whiteboard math
+├── Agentic_Memory_Architecture_Submission.pdf   # Final <= 1,200-word submission PDF (with 2 SVG diagrams)
+├── INTERVIEW_STUDY_GUIDE.md                     # Architecture defense guide, whiteboard math & Q&A
 ├── build/
-│   ├── generate_pdf.py                          # Reproducible HTML+SVG -> PDF builder & word-count auditor
+│   ├── generate_pdf.py                          # HTML + SVG -> PDF builder and strict word-count auditor
 │   └── submission.html                          # Rendered HTML source
 ├── src/
-│   └── epistemic_memory.py                      # Minimal zero-dependency reference engine
+│   └── epistemic_memory.py                      # Minimal zero-dependency Python reference model
 └── tests/
     └── stress_test.py                           # Compliance, adversarial scenario & 5k-run scale tests
 ```
 
-## Quickstart
+## Verification & Stress Tests
 
-Regenerate the submission PDF (requires Python 3.10+ and Google Chrome):
+Requires Python 3.10+ (standard library only for the reference engine and tests; Google Chrome for PDF regeneration).
 
 ```bash
+# 1. Regenerate the submission PDF and run the word-count audit
 python3 build/generate_pdf.py
-```
 
-Run the full compliance and adversarial stress-test suite:
-
-```bash
+# 2. Run the full compliance and adversarial stress-test suite (10 tests)
 python3 -m unittest tests/stress_test.py -v
 ```
+
+### What `tests/stress_test.py` Verifies
+
+1. **Submission Compliance:** Exact 6 headings in order, per-section and total (`1,157 <= 1,200`) word limits, XML-valid SVG diagrams (`<= 2`), and zero unexpected attribution tokens.
+2. **Scenario 1 (Staleness):** `T3` Postgres-16 error contests `T1` Postgres-14 via `CONTESTED_BY` without silent overwrite; verified `T1` check closes `valid_to` and activates Postgres 16.
+3. **Scenario 2 (Planted Memory):** `25` repeated `T3` Sybil tickets and summarization laundering attempts stay `QUARANTINED` and blocked at the outbound email sink-gate, while `T0` confirmation promotes valid updates.
+4. **Scenario 3 (Compounding Error):** Multi-hop `DERIVED_FROM` rollback triggered from a downstream leaf quarantines all `14` single-support derived claims while preserving `T1`-backed claims with penalized confidence.
+5. **Scenario 4 (Cross-Tenant Isolation):** Zero org-to-org leakage; public OSS bug patterns stay private at `9` orgs and promote to `global` at `k >= 10` (`30` orgs).
+6. **Concurrency, Forgetting & Scale:** Optimistic CAS mismatch rejection, Ebbinghaus `10,000/org` capping (protecting `T0`), `4,000`-token recall packing, `task`-scratch rejection, and a `5,000`-run / `200`-org simulation under budget.
+
+## Known Trade-Offs
+
+* **Silent `T1` Semantic Misreads:** If an internal `T1` tool returns valid JSON with ambiguous values (e.g., `04/05/2026`) and zero tool errors, repeated runs corroborate the wrong interpretation until a 2% human flag triggers DAG rollback. Catching silent semantic misreads per run would require a ground-truth oracle or per-read LLM audit, breaking both the `2.0` LLM-call and `300 ms` latency caps.
+* **Single-Process Reference Model:** `src/epistemic_memory.py` models the provenance DAG, CAS versioning, IFC gates, and JTMS rollback deterministically in memory using Python's standard library rather than binding to a specific external vector or graph database.
