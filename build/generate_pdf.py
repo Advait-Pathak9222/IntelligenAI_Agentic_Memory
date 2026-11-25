@@ -1,0 +1,428 @@
+import re
+import subprocess
+from pathlib import Path
+
+ROOT = Path("/Users/advaitpathak/Desktop/Placement Assignments/Intelligen-AI")
+BUILD_DIR = ROOT / "build"
+BUILD_DIR.mkdir(exist_ok=True)
+
+SECTIONS = {
+    "1. Thesis": (
+        "Store every agent memory as a taint-labeled, bi-temporal claim inside a provenance DAG: "
+        "deterministic trust gates and zero-LLM hybrid recall handle the critical path under 150 ms, "
+        "while batched sleep-time LLM calls resolve conflicts and contain errors under 0.3 extra calls per run."
+    ),
+    "2. Hardest sub-problem": (
+        "Trust and provenance (Point 3) coupled with error containment (Point 5) is hardest because "
+        "unsupervised agents cannot distinguish an authentic external update from a planted instruction "
+        "by text alone, and a single accepted error silently propagates across runs. With only 2% delayed "
+        "human feedback, the layer cannot call an LLM judge on every write. It must enforce "
+        "non-amplifying source authority at write time and maintain causal dependency edges so one "
+        "delayed correction retracts every downstream belief automatically."
+    ),
+    "3. Architecture": """<p><strong>Components &amp; Data Model.</strong> The memory layer separates a deterministic <em>Hot Path</em> (0 LLM calls, &le;150 ms p95) from an asynchronous <em>Sleep-Time Batch Lane</em>. Every memory is one structured <strong>Claim</strong> node in an org-partitioned store linked by directed <code>DERIVED_FROM</code>, <code>CONTESTED_BY</code>, and <code>SUPERSEDES</code> edges:</p>
+<table>
+  <thead>
+    <tr><th>Field</th><th>Values / Purpose</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>id, org_id, scope</code></td><td>UUID; strict tenant key; <code>task</code> | <code>user</code> | <code>org</code> | <code>global</code> (shared public playbooks only).</td></tr>
+    <tr><td><code>entity_key, text</code></td><td>Normalized subject key (e.g., <code>acme:prod_db</code>) + atomic claim (&le;40 tokens).</td></tr>
+    <tr><td><code>trust_tier</code></td><td>IFC integrity: <code>T0_HUMAN</code> &gt; <code>T1_VERIFIED</code> (API/tool) &gt; <code>T2_INFERRED</code> &gt; <code>T3_UNTRUSTED</code> (external text).</td></tr>
+    <tr><td><code>status, evidence</code></td><td><code>QUARANTINED</code> | <code>ACTIVE</code> | <code>CONTESTED</code> | <code>SUPERSEDED</code> | <code>RETRACTED</code>; prior <code>(pos,neg)</code>: <code>T0=(8,0)</code>, <code>T1=(3,0)</code>, <code>T2=(0,0)</code>, <code>T3=(0,2)</code>; <code>conf=(pos+1)/(pos+neg+2)</code>.</td></tr>
+    <tr><td><code>valid_from, valid_to</code></td><td>Bi-temporal validity window; closed on supersession instead of destructive overwrite.</td></tr>
+    <tr><td><code>derived_from[], run_id</code></td><td>Cited parent claim IDs + origin run for causal rollback; <code>version</code> (CAS) + <code>last_used, uses</code> for decay.</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li><strong>Write policy &amp; provenance:</strong> Recalled claims appear tagged <code>[id]</code> in context. At run end, the agent's output schema emits &le;3 candidate claims citing <code>source_step_ids</code> and <code>derived_from[]</code> (0 extra LLM calls). A deterministic rule gate drops raw transcripts, <code>task</code> scratch, failed retries, and ungrounded claims, and derives <code>trust_tier = min_trust(tool_logs, parents)</code> so agents cannot self-promote authority. <code>T3</code> starts <code>QUARANTINED</code> and cannot drive external actions.</li>
+  <li><strong>Concurrency &amp; revision:</strong> Commits take a short <code>(org_id, entity_key)</code> lock with optimistic CAS (<code>version</code>). Exact matches increment <code>pos</code> (0 LLM calls). Collisions on <code>entity_key</code>, similarity &gt;0.82, or contradicting <code>T1</code> errors queue a batched sleep-time LLM judge (5 pairs/call) returning <code>CONFIRM</code>, <code>SUPERSEDE</code> (sets <code>valid_to</code>), <code>COEXIST</code> (splits context-qualified keys), or <code>REJECT</code>. Cross-tier rule: <code>T3</code> may link a <code>CONTESTED_BY</code> edge and mark <code>CONTESTED</code>, never silently supersede <code>T0–T2</code>.</li>
+  <li><strong>Error containment:</strong> Retracting a claim walks <code>DERIVED_FROM</code> backward to unverified <code>T2</code>/<code>T3</code> roots and forward across all descendants; nodes lacking an independent <code>T0</code>/<code>T1</code> support path become <code>QUARANTINED</code> (0 LLM calls).</li>
+  <li><strong>Scope, recall &amp; forgetting:</strong> Hard <code>org_id</code> filtering isolates tenants. PII-scrubbed public-artifact patterns seen independently in <em>k</em> &ge; 10 orgs promote via 1 batch LLM call to <code>global</code> (zero org links). Recall runs zero-LLM hybrid BM25 + vector + 1-hop graph lookup on <code>ACTIVE</code>/<code>CONTESTED</code> claims (attaching <code>CONTESTED_BY</code> snippets as unverified hints), scored by <code>sim &times; conf &times; exp(-0.02&middot;days)</code> and packed into &le;4,000 tokens. Nightly Ebbinghaus eviction caps active claims at 10,000/org and compacts <code>SUPERSEDED</code>/<code>RETRACTED</code> leaf nodes &gt;90 days old.</li>
+  <li><strong>Measurement (no labels):</strong> A randomized memory-off holdout tracks repeat-task steps, tool retries, and 2% rejection rates.</li>
+</ul>
+<p><strong>Cost &amp; Latency Estimate (5,000 runs/day).</strong> Critical path uses <strong>0 LLM calls</strong>: recall ~70 ms median / ~140 ms p95 + &lt;10 ms write push (&le;150 ms p95, half the 300 ms cap). Async LLM calls/day: ~1,250 collision checks batched 5:1 = 250; ~100 delayed-feedback attributions = 100; ~50 global distillations/merges = 50. Total &approx; 400 calls/day (<strong>0.08 calls/run avg</strong>; &lt;0.30 unbatched, far under the 2.0 cap).</p>""",
+    "4. Walkthroughs": """<ol>
+  <li><strong>Staleness (Postgres 14 &rarr; 16):</strong> <em>Run (0 LLM):</em> Recall injects <code>C1: (acme:prod_db, "Postgres 14", T1, ACTIVE, Mar)</code>. Ticket shows a PG16-only error; agent emits <code>C2: (acme:prod_db, "Postgres 16 error", T3)</code>. <em>Sleep-time (1 batched LLM):</em> Entity collision triggers revision; because <code>C2</code> is <code>T3</code> vs <code>C1</code> <code>T1</code>, overwrite is blocked—<code>C1</code> turns <code>CONTESTED</code> via a <code>CONTESTED_BY</code> edge to <code>QUARANTINED</code> <code>C2</code>. <em>Next task (0 LLM):</em> Agent sees PG14 contested by unverified Sep PG16 evidence, so it checks DB version via tool (<code>T1</code>) or avoids PG14 assumptions; once <code>T1</code> or <code>T0</code> human confirms, <code>C1</code> closes (<code>valid_to=Sep</code>) and <code>C2</code> activates.</li>
+  <li><strong>Planted memory (<code>billing-help@acme-support.co</code>):</strong> <em>Run (0 LLM):</em> Ticket emits <code>C_mail</code> as <code>T3_UNTRUSTED</code>, <code>QUARANTINED</code>. Stored as an unverified hint, the deterministic sink-gate blocks auto-CCing domains absent from Acme's <code>T1</code> allowlist (even after <em>N</em> <code>T3</code> repeats). Real updates are not permanently lost: on the next escalation task, the sink-gate triggers <code>T1</code> CRM/DKIM domain check or surfaces it for <code>T0</code> human approval.</li>
+  <li><strong>Compounding error (Vendor Y UTC &rarr; 40 runs &rarr; 15 memories):</strong> Human flags 1 report days later. <em>Async (1 LLM):</em> Attributes fault among recalled claims (e.g., <code>D7</code> or <code>C_utc</code>). <em>Containment (0 LLM):</em> Walks <code>DERIVED_FROM</code> back to root <code>C_utc</code> (<code>RETRACTED</code>) and forward across all 15 derived claims, quarantining every claim without independent <code>T0</code>/<code>T1</code> support and logging the 40 <code>run_id</code>s. Future poisoning stops instantly; prior reports remain logged.</li>
+  <li><strong>Cross-tenant (30 orgs OSS bug &rarr; Org 31):</strong> <em>Yes.</em> Public package/error matches are PII-scrubbed and hashed (0 LLM). At <em>k</em> = 30 (&ge;10) orgs, <em>1 batch LLM call</em> creates an anonymized <code>global</code> rule (zero org IDs); Org 31 recalls it within 4k tokens.</li>
+</ol>""",
+    "5. How it fails": (
+        "<p><strong>Silent semantic misinterpretation without tool failure.</strong> Suppose Vendor Y's API returns ambiguous dates (<code>04/05/2026</code>) and the agent consistently parses <code>DD/MM</code> as <code>MM/DD</code> across valid <code>T1</code> JSON responses. No tool throws an error, no schema breaks, and repeated runs corroborate the wrong date-format claim, raising <code>conf</code> into <code>ACTIVE</code> memory. Because 98% of runs receive no human review, the misconception persists until a rare 2% human flag triggers DAG rollback days later.</p>"
+        "<p><strong>Why accept this risk:</strong> Catching silent semantic misreads per run requires an external ground-truth oracle or a second-opinion LLM audit on every tool output—violating both the 2-LLM-call budget and 300 ms critical-path latency cap. Bounded silent drift on zero-error-signal tasks is the unavoidable trade-off for cheap autonomy plus fast post-hoc containment.</p>"
+    ),
+    "6. Experiment": (
+        "<p><strong>7-Day Falsification Test.</strong> Run an 80/20 randomized A/B split across the live 5,000 tasks/day queue (~1,000 memory-off control runs/day vs. 4,000 memory-enabled treatment runs/day, giving ~140 control human labels/week for power), plus 60 fault-injected sandbox runs (20 stale configs, 20 planted external-domain tickets, 20 cascading derivations flagged on Day 3).</p>"
+        "<ul>"
+        "<li><strong>Measured metrics:</strong> (1) Repeat-task step count and tool-retry rate, (2) 2% human rejection rate (treatment vs. control), (3) planted-domain action leakage, (4) % of 15 derived claims quarantined within 60 s of Day-3 flag, (5) p95 memory latency and daily memory LLM calls/run.</li>"
+        "<li><strong>What proves the thesis wrong:</strong> Treatment increases human rejection rate over control, fails to cut repeat-task steps by &ge;10%, leaks &gt;0 actions to planted domains, quarantines &lt;100% of single-source derived errors, or exceeds 300 ms p95 / 2.0 LLM calls/run.</li>"
+        "</ul>"
+    ),
+}
+
+
+def strip_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = (
+        text.replace("&le;", "<=")
+        .replace("&ge;", ">=")
+        .replace("&rarr;", "->")
+        .replace("&times;", "x")
+        .replace("&middot;", "*")
+        .replace("&ndash;", "-")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&approx;", "~")
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def count_words():
+    total = 0
+    print("=== WORD COUNT AUDIT ===")
+    limits = {
+        "1. Thesis": 60,
+        "2. Hardest sub-problem": 100,
+        "3. Architecture": 500,
+        "4. Walkthroughs": 300,
+        "5. How it fails": 150,
+        "6. Experiment": 150,
+    }
+    for heading, body in SECTIONS.items():
+        clean_body = strip_html(body)
+        w_body = len(clean_body.split())
+        w_head = len(heading.split())
+        total += w_head + w_body
+        cap = limits[heading]
+        status = "OK" if w_body <= cap else "OVER!"
+        print(f"{heading:25s}: body={w_body:3d} / {cap:3d} [{status}] (+{w_head} heading = {w_head + w_body})")
+    print(f"TOTAL (with headings, excl. diagrams): {total} words (limit: 1200)")
+    return total
+
+
+DIAGRAM_1 = """
+<svg viewBox="0 0 820 315" width="100%" xmlns="http://www.w3.org/2000/svg" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#334155"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#1d4ed8"/>
+    </marker>
+    <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#b45309"/>
+    </marker>
+  </defs>
+
+  <!-- Background Lanes -->
+  <rect x="8" y="6" width="804" height="142" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+  <text x="20" y="24" font-size="10.5" font-weight="700" fill="#1e3a8a">HOT PATH — CRITICAL PATH (0 LLM calls, ≤150 ms p95)</text>
+
+  <rect x="8" y="164" width="804" height="144" rx="8" fill="#fffbeb" stroke="#fcd34d" stroke-width="1.2"/>
+  <text x="20" y="182" font-size="10.5" font-weight="700" fill="#92400e">SLEEP-TIME ASYNC LANE — OFF CRITICAL PATH (~0.08–0.30 LLM calls/run avg)</text>
+
+  <!-- Hot Path Boxes -->
+  <rect x="22" y="38" width="140" height="56" rx="6" fill="#ffffff" stroke="#64748b" stroke-width="1.3"/>
+  <text x="92" y="57" text-anchor="middle" font-size="11" font-weight="700" fill="#0f172a">Task Queue</text>
+  <text x="92" y="72" text-anchor="middle" font-size="9.5" fill="#475569">5,000/day · 200 orgs</text>
+  <text x="92" y="85" text-anchor="middle" font-size="9.5" fill="#475569">org_id + task_context</text>
+
+  <rect x="205" y="34" width="195" height="64" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.5"/>
+  <text x="302" y="51" text-anchor="middle" font-size="11" font-weight="700" fill="#1e40af">Hybrid Recall + IFC Gate</text>
+  <text x="302" y="66" text-anchor="middle" font-size="9.2" fill="#1e3a8a">BM25 + Vector + 1-hop Graph</text>
+  <text x="302" y="79" text-anchor="middle" font-size="9.2" fill="#1e3a8a">Score = sim × conf × decay</text>
+  <text x="302" y="92" text-anchor="middle" font-size="9.2" font-weight="600" fill="#1d4ed8">Pack ≤4k tokens (tag [id], no T3 act)</text>
+
+  <rect x="445" y="38" width="160" height="56" rx="6" fill="#ffffff" stroke="#0f172a" stroke-width="1.5"/>
+  <text x="525" y="56" text-anchor="middle" font-size="11" font-weight="700" fill="#0f172a">Headless Agent Loop</text>
+  <text x="525" y="71" text-anchor="middle" font-size="9.5" fill="#475569">Black-box LLM + Tools</text>
+  <text x="525" y="84" text-anchor="middle" font-size="9.5" fill="#475569">Reads untrusted inputs</text>
+
+  <rect x="648" y="38" width="150" height="56" rx="6" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.3"/>
+  <text x="723" y="56" text-anchor="middle" font-size="11" font-weight="700" fill="#166534">Write Staging Push</text>
+  <text x="723" y="71" text-anchor="middle" font-size="9.2" fill="#15803d">≤3 claims + cited [id]s</text>
+  <text x="723" y="84" text-anchor="middle" font-size="9.2" fill="#15803d">emitted in final step (0 LLM)</text>
+
+  <!-- Claim Store Pill in middle -->
+  <rect x="200" y="114" width="420" height="26" rx="5" fill="#e0e7ff" stroke="#4338ca" stroke-width="1.2"/>
+  <text x="410" y="131" text-anchor="middle" font-size="9.8" font-weight="700" fill="#312e81">Epistemic Provenance DAG (Claim Nodes + DERIVED_FROM / CONTESTED_BY / SUPERSEDES)</text>
+
+  <!-- Sleep Lane Boxes -->
+  <rect x="22" y="194" width="175" height="64" rx="6" fill="#ffffff" stroke="#d97706" stroke-width="1.3"/>
+  <text x="109" y="211" text-anchor="middle" font-size="10.2" font-weight="700" fill="#92400e">1. Deterministic Gate + CAS</text>
+  <text x="109" y="226" text-anchor="middle" font-size="8.8" fill="#78350f">Verify logs → T0–T3 (non-amp)</text>
+  <text x="109" y="239" text-anchor="middle" font-size="8.8" fill="#78350f">Exact match → pos++ (0 LLM)</text>
+  <text x="109" y="252" text-anchor="middle" font-size="8.8" fill="#78350f">T3 → QUARANTINED; CAS lock</text>
+
+  <rect x="222" y="194" width="185" height="64" rx="6" fill="#fef3c7" stroke="#b45309" stroke-width="1.4"/>
+  <text x="314" y="211" text-anchor="middle" font-size="10.2" font-weight="700" fill="#78350f">2. Batched Conflict Revision</text>
+  <text x="314" y="226" text-anchor="middle" font-size="8.8" fill="#78350f">Only collisions / sim &gt; 0.82</text>
+  <text x="314" y="239" text-anchor="middle" font-size="8.8" fill="#78350f">5 pairs/LLM → SUPERSEDE /</text>
+  <text x="314" y="252" text-anchor="middle" font-size="8.8" fill="#78350f">CONTESTED / COEXIST / REJECT</text>
+
+  <rect x="432" y="194" width="180" height="64" rx="6" fill="#fef2f2" stroke="#dc2626" stroke-width="1.4"/>
+  <text x="522" y="211" text-anchor="middle" font-size="10.2" font-weight="700" fill="#991b1b">3. JTMS Error Containment</text>
+  <text x="522" y="226" text-anchor="middle" font-size="8.8" fill="#7f1d1d">2% human flag (1 LLM attr.)</text>
+  <text x="522" y="239" text-anchor="middle" font-size="8.8" fill="#7f1d1d">Walk back → root, forward → BFS</text>
+  <text x="522" y="252" text-anchor="middle" font-size="8.8" fill="#7f1d1d">Quarantine unsupported subgraph</text>
+
+  <rect x="636" y="194" width="162" height="64" rx="6" fill="#ffffff" stroke="#0d9488" stroke-width="1.3"/>
+  <text x="717" y="211" text-anchor="middle" font-size="10.2" font-weight="700" fill="#115e59">4. Global k-Anon &amp; Decay</text>
+  <text x="717" y="226" text-anchor="middle" font-size="8.8" fill="#134e4a">PII scrub; k ≥ 10 orgs → global</text>
+  <text x="717" y="239" text-anchor="middle" font-size="8.8" fill="#134e4a">Nightly Ebbinghaus pruning</text>
+  <text x="717" y="252" text-anchor="middle" font-size="8.8" fill="#134e4a">Cap 10k/org; compact leaves &gt;90d</text>
+
+  <text x="410" y="294" text-anchor="middle" font-size="9.2" fill="#64748b">Delayed Human Feedback (~2% outputs, days later) feeds Step 3 • All sleep-lane steps commit via CAS to Provenance DAG</text>
+
+  <!-- Arrows -->
+  <line x1="162" y1="66" x2="203" y2="66" stroke="#334155" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="400" y1="66" x2="443" y2="66" stroke="#1d4ed8" stroke-width="1.4" marker-end="url(#arrow-blue)"/>
+  <line x1="605" y1="66" x2="646" y2="66" stroke="#334155" stroke-width="1.4" marker-end="url(#arrow)"/>
+  <line x1="302" y1="114" x2="302" y2="100" stroke="#1d4ed8" stroke-width="1.3" marker-end="url(#arrow-blue)"/>
+  <path d="M 723 94 L 723 155 L 109 155 L 109 192" fill="none" stroke="#b45309" stroke-width="1.3" marker-end="url(#arrow-amber)"/>
+  <line x1="197" y1="226" x2="220" y2="226" stroke="#b45309" stroke-width="1.3" marker-end="url(#arrow-amber)"/>
+  <path d="M 109 258 L 109 272 L 717 272 L 717 258" fill="none" stroke="#4338ca" stroke-width="1.0" stroke-dasharray="3,2"/>
+  <path d="M 314 258 L 314 272 M 522 258 L 522 272" fill="none" stroke="#4338ca" stroke-width="1.0" stroke-dasharray="3,2"/>
+  <path d="M 555 194 L 555 142" fill="none" stroke="#4338ca" stroke-width="1.3" marker-end="url(#arrow-blue)"/>
+</svg>
+"""
+
+DIAGRAM_2 = """
+<svg viewBox="0 0 820 168" width="100%" xmlns="http://www.w3.org/2000/svg" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#334155"/>
+    </marker>
+    <marker id="arr2-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <!-- Left panel: IFC Quarantine Gate -->
+  <rect x="8" y="6" width="394" height="156" rx="8" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+  <text x="20" y="24" font-size="10.2" font-weight="700" fill="#0f172a">A. IFC Non-Amplification &amp; Quarantine (Scenarios 1 &amp; 2)</text>
+
+  <rect x="20" y="36" width="105" height="42" rx="5" fill="#fee2e2" stroke="#dc2626" stroke-width="1.2"/>
+  <text x="72" y="53" text-anchor="middle" font-size="9.5" font-weight="700" fill="#991b1b">External Ticket</text>
+  <text x="72" y="67" text-anchor="middle" font-size="8.5" fill="#7f1d1d">T3_UNTRUSTED</text>
+
+  <rect x="148" y="36" width="115" height="42" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="1.2"/>
+  <text x="205" y="53" text-anchor="middle" font-size="9.5" font-weight="700" fill="#92400e">QUARANTINED</text>
+  <text x="205" y="67" text-anchor="middle" font-size="8.5" fill="#78350f">N×T3 still cannot promote</text>
+
+  <rect x="286" y="36" width="104" height="42" rx="5" fill="#f1f5f9" stroke="#64748b" stroke-width="1.2"/>
+  <text x="338" y="52" text-anchor="middle" font-size="9.5" font-weight="700" fill="#334155">Action Sink Gate</text>
+  <text x="338" y="66" text-anchor="middle" font-size="8.5" fill="#dc2626">Block external CC</text>
+
+  <rect x="20" y="100" width="165" height="46" rx="5" fill="#dcfce7" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="102" y="118" text-anchor="middle" font-size="9.5" font-weight="700" fill="#166534">T1 API / DKIM / T0 Human</text>
+  <text x="102" y="132" text-anchor="middle" font-size="8.5" fill="#15803d">Real update corroboration</text>
+
+  <rect x="220" y="100" width="170" height="46" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="305" y="118" text-anchor="middle" font-size="9.5" font-weight="700" fill="#1e40af">ACTIVE (Valid Window)</text>
+  <text x="305" y="132" text-anchor="middle" font-size="8.5" fill="#1e3a8a">Old claim → SUPERSEDED</text>
+
+  <line x1="125" y1="57" x2="146" y2="57" stroke="#334155" stroke-width="1.2" marker-end="url(#arr2)"/>
+  <line x1="263" y1="57" x2="284" y2="57" stroke="#dc2626" stroke-width="1.2" marker-end="url(#arr2-red)"/>
+  <line x1="185" y1="123" x2="218" y2="123" stroke="#334155" stroke-width="1.2" marker-end="url(#arr2)"/>
+  <line x1="205" y1="78" x2="255" y2="98" stroke="#334155" stroke-width="1.1" stroke-dasharray="3,2" marker-end="url(#arr2)"/>
+
+  <!-- Right panel: JTMS Blast-Radius Rollback -->
+  <rect x="416" y="6" width="396" height="156" rx="8" fill="#fef2f2" stroke="#fca5a5" stroke-width="1.2"/>
+  <text x="428" y="24" font-size="10.2" font-weight="700" fill="#991b1b">B. Bidirectional JTMS Causal Rollback (Scenario 3)</text>
+
+  <rect x="430" y="40" width="112" height="40" rx="5" fill="#fee2e2" stroke="#b91c1c" stroke-width="1.5"/>
+  <text x="486" y="56" text-anchor="middle" font-size="9.5" font-weight="700" fill="#7f1d1d">C_utc (Root Fault)</text>
+  <text x="486" y="70" text-anchor="middle" font-size="8.5" fill="#991b1b">Walk back → RETRACTED</text>
+
+  <rect x="578" y="38" width="102" height="44" rx="5" fill="#fef3c7" stroke="#b45309" stroke-width="1.3"/>
+  <text x="629" y="54" text-anchor="middle" font-size="9" font-weight="700" fill="#78350f">Derived Claim A..M</text>
+  <text x="629" y="66" text-anchor="middle" font-size="8.2" fill="#92400e">Solely on C_utc</text>
+  <text x="629" y="77" text-anchor="middle" font-size="8.2" font-weight="700" fill="#b91c1c">→ QUARANTINED</text>
+
+  <rect x="578" y="100" width="102" height="46" rx="5" fill="#ecfdf5" stroke="#059669" stroke-width="1.3"/>
+  <text x="629" y="116" text-anchor="middle" font-size="9" font-weight="700" fill="#065f46">Derived Claim N..O</text>
+  <text x="629" y="128" text-anchor="middle" font-size="8.2" fill="#047857">Has alt T1 support</text>
+  <text x="629" y="139" text-anchor="middle" font-size="8.2" fill="#065f46">→ conf penalized</text>
+
+  <rect x="702" y="60" width="96" height="56" rx="5" fill="#ffffff" stroke="#dc2626" stroke-width="1.2"/>
+  <text x="750" y="77" text-anchor="middle" font-size="9" font-weight="700" fill="#991b1b">Human Flag</text>
+  <text x="750" y="90" text-anchor="middle" font-size="8.2" fill="#7f1d1d">Report #40 wrong</text>
+  <text x="750" y="102" text-anchor="middle" font-size="8.2" fill="#7f1d1d">(1 LLM attr. +</text>
+  <text x="750" y="112" text-anchor="middle" font-size="8.2" fill="#7f1d1d">0-LLM BFS)</text>
+
+  <rect x="430" y="106" width="112" height="40" rx="5" fill="#dcfce7" stroke="#16a34a" stroke-width="1.2"/>
+  <text x="486" y="122" text-anchor="middle" font-size="9" font-weight="700" fill="#166534">Independent T1</text>
+  <text x="486" y="135" text-anchor="middle" font-size="8.2" fill="#15803d">Alternate proof</text>
+
+  <line x1="542" y1="60" x2="576" y2="60" stroke="#dc2626" stroke-width="1.3" marker-end="url(#arr2-red)"/>
+  <line x1="542" y1="69" x2="576" y2="112" stroke="#dc2626" stroke-width="1.2" marker-end="url(#arr2-red)"/>
+  <line x1="542" y1="126" x2="576" y2="126" stroke="#16a34a" stroke-width="1.3" marker-end="url(#arr2)"/>
+  <line x1="702" y1="78" x2="682" y2="65" stroke="#dc2626" stroke-width="1.2" stroke-dasharray="3,2" marker-end="url(#arr2-red)"/>
+</svg>
+"""
+
+
+def build_html():
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Agentic Memory for Headless Agents — Architecture Submission</title>
+<style>
+  @page {{
+    size: A4;
+    margin: 12mm 14mm 13mm 14mm;
+  }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: #0f172a;
+    font-size: 9.3pt;
+    line-height: 1.38;
+    margin: 0;
+  }}
+  header {{
+    border-bottom: 2px solid #1e3a8a;
+    padding-bottom: 5px;
+    margin-bottom: 8px;
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }}
+  header h1 {{
+    font-size: 14pt;
+    margin: 0;
+    color: #0f172a;
+    letter-spacing: -0.2px;
+  }}
+  header span {{
+    font-size: 8.5pt;
+    color: #475569;
+  }}
+  h2 {{
+    font-size: 10.7pt;
+    color: #1e3a8a;
+    margin: 8px 0 3.5px 0;
+    border-left: 3px solid #2563eb;
+    padding-left: 7px;
+    break-after: avoid;
+    page-break-after: avoid;
+  }}
+  p {{
+    margin: 3px 0 5px 0;
+  }}
+  ul, ol {{
+    margin: 3px 0 5px 0;
+    padding-left: 18px;
+  }}
+  li {{
+    margin-bottom: 2.5px;
+  }}
+  code {{
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 8.1pt;
+    background: #f1f5f9;
+    padding: 0.5px 3px;
+    border-radius: 3px;
+    color: #0f172a;
+  }}
+  table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin: 4px 0 6px 0;
+    font-size: 8.3pt;
+  }}
+  th, td {{
+    border: 1px solid #cbd5e1;
+    padding: 2.8px 6px;
+    text-align: left;
+    vertical-align: top;
+  }}
+  th {{
+    background: #f1f5f9;
+    font-weight: 700;
+    color: #1e293b;
+  }}
+  .diagram {{
+    margin: 5px 0 6px 0;
+    text-align: center;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }}
+  .caption {{
+    font-size: 7.9pt;
+    color: #475569;
+    margin-top: 2px;
+    font-style: italic;
+  }}
+  .section-block {{
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }}
+</style>
+</head>
+<body>
+  <header>
+    <h1>Agentic Memory for Headless Agents</h1>
+    <span>Epistemic Provenance Graph Architecture &bull; IIT BHU 2027</span>
+  </header>
+
+  <div class="section-block">
+    <h2>1. Thesis</h2>
+    <p>{SECTIONS["1. Thesis"]}</p>
+  </div>
+
+  <div class="section-block">
+    <h2>2. Hardest sub-problem</h2>
+    <p>{SECTIONS["2. Hardest sub-problem"]}</p>
+  </div>
+
+  <h2>3. Architecture</h2>
+  {SECTIONS["3. Architecture"]}
+  <div class="diagram">
+    {DIAGRAM_1}
+    <div class="caption">Figure 1: Two-lane Epistemic Provenance Graph separating zero-LLM critical-path recall/staging from batched sleep-time revision and containment.</div>
+  </div>
+
+  <h2>4. Walkthroughs</h2>
+  {SECTIONS["4. Walkthroughs"]}
+  <div class="diagram">
+    {DIAGRAM_2}
+    <div class="caption">Figure 2: (A) Non-amplifying IFC quarantine gate for external claims; (B) Bidirectional JTMS blast-radius rollback on delayed 2% human feedback.</div>
+  </div>
+
+  <div class="section-block">
+    <h2>5. How it fails</h2>
+    {SECTIONS["5. How it fails"]}
+  </div>
+
+  <div class="section-block">
+    <h2>6. Experiment</h2>
+    {SECTIONS["6. Experiment"]}
+  </div>
+</body>
+</html>
+"""
+    html_path = BUILD_DIR / "submission.html"
+    html_path.write_text(html, encoding="utf-8")
+    return html_path
+
+
+if __name__ == "__main__":
+    total = count_words()
+    assert total <= 1200, f"Word limit exceeded: {total} > 1200"
+    html_path = build_html()
+    pdf_path = ROOT / "Agentic_Memory_Architecture_Submission.pdf"
+    chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    cmd = [
+        chrome,
+        "--headless",
+        "--disable-gpu",
+        "--no-pdf-header-footer",
+        f"--print-to-pdf={pdf_path}",
+        html_path.as_uri(),
+    ]
+    subprocess.run(cmd, check=True)
+    print(f"Generated PDF: {pdf_path}")
