@@ -80,19 +80,19 @@ pip install -r requirements.txt
 # 1. Regenerate the submission PDF and run the word-count audit
 python3 build/generate_pdf.py
 
-# 2. Run the full compliance and production stress-test suite (11 tests)
+# 2. Run the full compliance and production stress-test suite (15 tests)
 python3 -m unittest tests/stress_test.py -v
 ```
 
 ### What `tests/stress_test.py` Verifies
 
 1. **Submission Compliance:** Exact 6 headings in order, per-section and total (`1,157 <= 1,200`) word limits, XML-valid SVG diagrams (`<= 2`), and zero unexpected attribution tokens.
-2. **Persisted Hybrid Recall:** SQLite FTS5 BM25 + NumPy dense vector scores persist across database close/reopen and render `[id]`-tagged context blocks.
-3. **Scenario 1 (Staleness):** `T3` Postgres-16 error contests `T1` Postgres-14 via `CONTESTED_BY` without silent overwrite; `T1` verification closes `valid_to`, activates Postgres 16, and writes a `SUPERSEDES` edge.
+2. **Persisted Hybrid Recall & `MockTransport` HTTP Adapters:** SQLite FTS5 BM25 + NumPy dense vector scores persist across database close/reopen; `OpenAIEmbedder` and `OpenAICompatibleJudge` verified with `httpx.MockTransport` (5:1 conflict batching, HTTP error propagation, attribution, and distillation without API keys).
+3. **Scenario 1 (Staleness) & `COEXIST` Vector Collisions:** `T3` Postgres-16 error contests `T1` Postgres-14 via `CONTESTED_BY` without silent overwrite; `T1` verification closes `valid_to` and writes `SUPERSEDES`. Distinct-key collisions (`sim > 0.82`) trigger `COEXIST` environment key splitting.
 4. **Scenario 2 (Planted Memory):** `20` repeated `T3` Sybil tickets and summarization laundering attempts stay `QUARANTINED` and blocked at the outbound email sink-gate, while `T0` confirmation promotes valid updates.
 5. **Scenario 3 (Compounding Error):** Delayed feedback triggers async attribution and bidirectional `DERIVED_FROM` rollback, retracting root `C_utc`, quarantining all `14` single-support derived claims, and preserving `T1`-backed claims with penalized confidence.
-6. **Scenario 4 (Cross-Tenant Isolation):** Zero org-to-org leakage; public OSS bug patterns stay private at `9` orgs and promote to `global` at `k >= 10` (`30` orgs) with org identifiers scrubbed.
-7. **10-Process OS Concurrency & Scale:** `10` spawned OS worker processes racing simultaneously on SQLite WAL (`BEGIN IMMEDIATE` + `UPDATE ... RETURNING *` job claims, `PRAGMA data_version` vector cache sync, `1` CAS winner / `9` CAS conflicts, `0` duplicate active entity claims), plus `asyncio` worker loop, Ebbinghaus `10,000/org` capping, and critical-path latency + batched LLM budget checks.
+6. **Scenario 4 (Cross-Tenant & User Isolation):** Zero org-to-org leakage and fail-closed `Scope.USER` filtering (`user_id=None` or mismatched users blocked); public OSS bug patterns stay private at `9` orgs and promote to `global` at `k >= 10` (`30` orgs).
+7. **10-Process OS Concurrency, Retries & Decay:** `10` spawned OS worker processes racing simultaneously on SQLite WAL (`1` CAS winner / `9` CAS conflicts, `0` duplicate active entity claims), transient job retry & dead-letter `FAILED` state after 3 attempts, >90-day leaf compaction protecting parents with active children, Ebbinghaus `10,000/org` capping, and critical-path latency + batched LLM budget checks.
 
 ## Known Trade-Offs
 

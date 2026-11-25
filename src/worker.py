@@ -65,35 +65,51 @@ class SleepTimeWorker:
 
         # 1. Staged writes (deterministic gate + collision detection)
         for job in self.repo.claim_pending_jobs(JobType.STAGE_WRITE, limit=100):
-            self._handle_stage_write(job["org_id"], job["payload"], now=now)
-            self.repo.finish_job(job["id"], "DONE")
-            handled += 1
+            try:
+                self._handle_stage_write(job["org_id"], job["payload"], now=now)
+                self.repo.finish_job(job["id"], "DONE")
+                handled += 1
+            except Exception:
+                self.repo.retry_or_fail_job(job["id"])
 
         # 2. Batched conflict revisions (up to 5 pairs per LLM call)
         conflict_jobs = self.repo.claim_pending_jobs(JobType.RESOLVE_CONFLICT, limit=50)
         if conflict_jobs:
-            self._handle_batched_conflicts(conflict_jobs, now=now)
-            for job in conflict_jobs:
-                self.repo.finish_job(job["id"], "DONE")
-                handled += 1
+            try:
+                self._handle_batched_conflicts(conflict_jobs, now=now)
+                for job in conflict_jobs:
+                    self.repo.finish_job(job["id"], "DONE")
+                    handled += 1
+            except Exception:
+                for job in conflict_jobs:
+                    self.repo.retry_or_fail_job(job["id"])
 
         # 3. Delayed 2% human feedback attribution + bidirectional JTMS rollback
         for job in self.repo.claim_pending_jobs(JobType.FEEDBACK_ROLLBACK, limit=25):
-            self._handle_feedback_rollback(job["payload"])
-            self.repo.finish_job(job["id"], "DONE")
-            handled += 1
+            try:
+                self._handle_feedback_rollback(job["payload"])
+                self.repo.finish_job(job["id"], "DONE")
+                handled += 1
+            except Exception:
+                self.repo.retry_or_fail_job(job["id"])
 
         # 4. Cross-tenant k-anonymous public-artifact distillation
         for job in self.repo.claim_pending_jobs(JobType.GLOBAL_DISTILL, limit=50):
-            self._handle_global_distill(job["org_id"], job["payload"], now=now)
-            self.repo.finish_job(job["id"], "DONE")
-            handled += 1
+            try:
+                self._handle_global_distill(job["org_id"], job["payload"], now=now)
+                self.repo.finish_job(job["id"], "DONE")
+                handled += 1
+            except Exception:
+                self.repo.retry_or_fail_job(job["id"])
 
         # 5. Nightly bounded forgetting & leaf compaction
         for job in self.repo.claim_pending_jobs(JobType.DECAY_COMPACT, limit=50):
-            self.enforce_bounded_forgetting(job["org_id"], now=now)
-            self.repo.finish_job(job["id"], "DONE")
-            handled += 1
+            try:
+                self.enforce_bounded_forgetting(job["org_id"], now=now)
+                self.repo.finish_job(job["id"], "DONE")
+                handled += 1
+            except Exception:
+                self.repo.retry_or_fail_job(job["id"])
 
         return handled
 

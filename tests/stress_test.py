@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import re
 import sys
@@ -10,6 +11,9 @@ import time
 import unittest
 import xml.etree.ElementTree as ET
 
+import httpx
+import numpy as np
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -17,9 +21,14 @@ from build.generate_pdf import DIAGRAM_1, DIAGRAM_2, SECTIONS, count_words
 from src import (
     AgentMemoryLayer,
     CandidateClaim,
+    Claim,
     ClaimStatus,
     ConcurrencyConflictError,
     EdgeType,
+    JobType,
+    OpenAICompatibleJudge,
+    OpenAIEmbedder,
+    RevisionAction,
     Scope,
     TrustTier,
 )
@@ -578,6 +587,256 @@ class ProductionMemoryStressTests(unittest.TestCase):
             """
         ).fetchall()
         self.assertEqual(len(dup_rows), 0)
+
+    def test_openai_http_adapters_with_mock_transport(self) -> None:
+        embed_requests = []
+
+        def embed_handler(request: httpx.Request) -> httpx.Response:
+            embed_requests.append(request)
+            body = json.loads(request.content.decode("utf-8"))
+            if body["input"] == ["trigger_503"]:
+                return httpx.Response(503, json={"error": "upstream unavailable"})
+            vecs = [[3.0, 4.0, 0.0, 0.0] for _ in body["input"]]
+            return httpx.Response(200, json={"data": [{"embedding": v} for v in vecs]})
+
+        embedder = OpenAIEmbedder(
+            dim=4,
+            api_key="test-key-not-real",
+            transport=httpx.MockTransport(embed_handler),
+        )
+        mat = embedder.embed_batch(["hello", "world"])
+        self.assertEqual(mat.shape, (2, 4))
+        self.assertAlmostEqual(float(np.linalg.norm(mat[0])), 1.0, places=5)
+        self.assertEqual(embed_requests[0].headers["authorization"], "Bearer test-key-not-real")
+        with self.assertRaises(httpx.HTTPStatusError):
+            embedder.embed("trigger_503")
+
+        judge_calls = []
+
+        def judge_handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            judge_calls.append(body)
+            user_payload = json.loads(body["messages"][1]["content"])
+            if "pairs" in user_payload:
+                decisions = [
+                    {
+                        "existing_id": p["existing_id"],
+                        "candidate_id": p["candidate_id"],
+                        "action": "SUPERSEDE",
+                        "split_entity_key": None,
+                        "reason": "mocked",
+                    }
+                    for p in user_payload["pairs"]
+                ]
+                return httpx.Response(
+                    200,
+                    json={"choices": [{"message": {"content": json.dumps({"decisions": decisions})}}]},
+                )
+            if "recalled_claims" in user_payload:
+                return httpx.Response(
+                    200,
+                    json={
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": json.dumps(
+                                        {"faulty_claim_ids": [user_payload["recalled_claims"][0]["id"]]}
+                                    )
+                                }
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": json.dumps({"rule": "Distilled OSS rule"})}}]},
+            )
+
+        judge = OpenAICompatibleJudge(
+            api_key="test-key-not-real",
+            transport=httpx.MockTransport(judge_handler),
+        )
+        dummy_pairs = [
+            (
+                Claim("org", Scope.ORG, f"k{i}", "old", TrustTier.T1_VERIFIED, ClaimStatus.ACTIVE, 3, 0, self.now, "r1", id=f"o{i}"),
+                Claim("org", Scope.ORG, f"k{i}", "new", TrustTier.T1_VERIFIED, ClaimStatus.QUARANTINED, 3, 0, self.now, "r2", id=f"n{i}"),
+            )
+            for i in range(7)
+        ]
+        decs = judge.batched_revise_conflicts(dummy_pairs)
+        self.assertEqual(len(decs), 7)
+        self.assertTrue(all(d.action == RevisionAction.SUPERSEDE for d in decs))
+        # 7 pairs packed 5:1 -> 2 LLM calls
+        self.assertEqual(judge.llm_calls_made, 2)
+
+        faulty = judge.attribute_feedback("bad report", "wrong date", [dummy_pairs[0][0]])
+        self.assertEqual(faulty, ["o0"])
+        rule = judge.distill_global_rule("sig_x", ["sample 1"])
+        self.assertEqual(rule, "Distilled OSS rule")
+        self.assertEqual(judge.llm_calls_made, 4)
+
+    def test_vector_similarity_collision_and_coexist_split(self) -> None:
+        self.layer.stage_run_claims(
+            org_id="acme",
+            run_id="r_prod",
+            candidates=[
+                CandidateClaim(
+                    entity_key="acme:db_a",
+                    text="Acme primary relational database cluster for billing analytics runs Postgres 14 in prod",
+                    source_step_ids=["s1"],
+                )
+            ],
+            tool_logs={"s1": TrustTier.T1_VERIFIED},
+        )
+        self.layer.worker.drain_once(now=self.now)
+
+        # Different entity_key ("acme:db_b") with cosine similarity ~0.90 (>0.82) + staging hint
+        self.layer.stage_run_claims(
+            org_id="acme",
+            run_id="r_stg",
+            candidates=[
+                CandidateClaim(
+                    entity_key="acme:db_b",
+                    text="Acme primary relational database cluster for billing analytics runs Postgres 14 in staging",
+                    source_step_ids=["s2"],
+                )
+            ],
+            tool_logs={"s2": TrustTier.T1_VERIFIED},
+        )
+        self.layer.worker.drain_once(now=self.now)
+
+        active_claims = [c for c in self.layer.repo.list_org_claims("acme") if c.status == ClaimStatus.ACTIVE]
+        keys = {c.entity_key for c in active_claims}
+        self.assertEqual(len(active_claims), 2)
+        self.assertIn("acme:db_a", keys)
+        self.assertIn("acme:db_b:staging", keys)
+        self.assertEqual(self.layer.judge.llm_calls_made, 1)
+
+    def test_leaf_compaction_protects_parents_with_active_children(self) -> None:
+        old_time = self.now - timedelta(days=120)
+
+        # Old >90d SUPERSEDED parent WITH an ACTIVE child -> MUST BE PROTECTED
+        parent = Claim(
+            org_id="org_leaf",
+            scope=Scope.ORG,
+            entity_key="org_leaf:root",
+            text="Old root belief",
+            trust_tier=TrustTier.T2_INFERRED,
+            status=ClaimStatus.SUPERSEDED,
+            pos=1,
+            neg=0,
+            valid_from=old_time,
+            valid_to=old_time + timedelta(days=1),
+            run_id="r_old",
+            last_used=old_time,
+        )
+        child = Claim(
+            org_id="org_leaf",
+            scope=Scope.ORG,
+            entity_key="org_leaf:child",
+            text="Active derived belief",
+            trust_tier=TrustTier.T2_INFERRED,
+            status=ClaimStatus.ACTIVE,
+            pos=2,
+            neg=0,
+            valid_from=self.now - timedelta(days=5),
+            run_id="r_new",
+            last_used=self.now - timedelta(days=2),
+        )
+        # Old >90d SUPERSEDED leaf with ZERO active children -> MUST BE COMPACTED
+        dead_leaf = Claim(
+            org_id="org_leaf",
+            scope=Scope.ORG,
+            entity_key="org_leaf:dead_leaf",
+            text="Dead obsolete leaf",
+            trust_tier=TrustTier.T2_INFERRED,
+            status=ClaimStatus.SUPERSEDED,
+            pos=0,
+            neg=1,
+            valid_from=old_time,
+            valid_to=old_time + timedelta(days=1),
+            run_id="r_dead",
+            last_used=old_time,
+        )
+        self.layer.repo.insert_claim(parent)
+        self.layer.repo.insert_claim(child)
+        self.layer.repo.insert_claim(dead_leaf)
+        self.layer.repo.add_edge(parent.id, child.id, EdgeType.DERIVED_FROM)
+
+        removed = self.layer.worker.enforce_bounded_forgetting("org_leaf", now=self.now)
+        self.assertEqual(removed, 1)
+        self.assertIsNotNone(self.layer.repo.get_claim(parent.id))
+        self.assertIsNotNone(self.layer.repo.get_claim(child.id))
+        self.assertIsNone(self.layer.repo.get_claim(dead_leaf.id))
+
+    def test_user_scope_isolation_and_failed_job_retry_dead_letter(self) -> None:
+        # Scope.USER isolation: Alice's preference must never appear to Bob or user_id=None
+        self.layer.stage_run_claims(
+            org_id="acme",
+            run_id="r_alice",
+            candidates=[
+                CandidateClaim(
+                    entity_key="user:report_format",
+                    text="Alice prefers concise markdown tables",
+                    scope=Scope.USER,
+                    user_id="alice",
+                    source_step_ids=["u1"],
+                )
+            ],
+            tool_logs={"u1": TrustTier.T1_VERIFIED},
+        )
+        self.layer.worker.drain_once(now=self.now)
+
+        self.assertEqual(len(self.layer.recall("acme", "markdown tables", user_id="alice", now=self.now)), 1)
+        self.assertEqual(self.layer.recall("acme", "markdown tables", user_id="bob", now=self.now), [])
+        self.assertEqual(self.layer.recall("acme", "markdown tables", user_id=None, now=self.now), [])
+
+        # Transient failure retries twice then succeeds; permanent failure dead-letters as FAILED after 3 attempts
+        bad_job_id = self.layer.repo.enqueue_job(
+            JobType.STAGE_WRITE, "acme", {"broken": "missing_scope_field"}
+        )
+        flaky_job_id = self.layer.repo.enqueue_job(
+            JobType.STAGE_WRITE,
+            "acme",
+            {
+                "run_id": "r_flaky",
+                "scope": "org",
+                "entity_key": "acme:flaky_ok",
+                "text": "Recovered after transient failure",
+                "source_step_ids": ["s1"],
+                "tool_logs": {"s1": int(TrustTier.T1_VERIFIED)},
+            },
+        )
+
+        orig_handler = self.layer.worker._handle_stage_write
+        flaky_calls = {"count": 0}
+
+        def flaky_wrapper(org_id: str, payload: dict, now: datetime) -> None:
+            if payload.get("run_id") == "r_flaky":
+                flaky_calls["count"] += 1
+                if flaky_calls["count"] < 3:
+                    raise RuntimeError("transient error")
+            return orig_handler(org_id, payload, now)
+
+        self.layer.worker._handle_stage_write = flaky_wrapper  # type: ignore[method-assign]
+        try:
+            self.layer.worker.drain_once(now=self.now)
+            self.layer.worker.drain_once(now=self.now)
+            self.layer.worker.drain_once(now=self.now)
+        finally:
+            self.layer.worker._handle_stage_write = orig_handler  # type: ignore[method-assign]
+
+        bad_row = self.layer.repo.conn.execute(
+            "SELECT status, attempts FROM async_jobs WHERE id = ?", (bad_job_id,)
+        ).fetchone()
+        flaky_row = self.layer.repo.conn.execute(
+            "SELECT status, attempts FROM async_jobs WHERE id = ?", (flaky_job_id,)
+        ).fetchone()
+        self.assertEqual(bad_row["status"], "FAILED")
+        self.assertEqual(bad_row["attempts"], 3)
+        self.assertEqual(flaky_row["status"], "DONE")
+        self.assertEqual(flaky_row["attempts"], 3)
+        self.assertIsNotNone(self.layer.repo.find_active_by_entity("acme", "acme:flaky_ok"))
 
 
 def _mp_worker_task(

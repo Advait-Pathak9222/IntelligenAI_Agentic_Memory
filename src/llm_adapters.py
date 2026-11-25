@@ -102,11 +102,13 @@ class OpenAICompatibleJudge:
         api_key: Optional[str] = None,
         base_url: str = "https://api.openai.com/v1",
         timeout: float = 20.0,
+        transport: Optional[httpx.BaseTransport] = None,
     ) -> None:
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.transport = transport
         self.llm_calls_made = 0
 
     def _chat_json(self, system_prompt: str, user_prompt: str) -> dict:
@@ -121,7 +123,7 @@ class OpenAICompatibleJudge:
                 {"role": "user", "content": user_prompt},
             ],
         }
-        with httpx.Client(timeout=self.timeout) as client:
+        with httpx.Client(timeout=self.timeout, transport=self.transport) as client:
             resp = client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
             resp.raise_for_status()
             content = resp.json()["choices"][0]["message"]["content"]

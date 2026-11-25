@@ -78,7 +78,7 @@ class AgentMemoryLayer:
                 continue
             if c.scope != Scope.GLOBAL and c.org_id != org_id:
                 continue
-            if c.scope == Scope.USER and user_id is not None and c.user_id != user_id:
+            if c.scope == Scope.USER and (user_id is None or c.user_id != user_id):
                 continue
             if c.status not in (ClaimStatus.ACTIVE, ClaimStatus.CONTESTED):
                 continue

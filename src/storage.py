@@ -442,6 +442,10 @@ class ClaimRepository:
                 raise ConcurrencyConflictError(
                     f"CAS conflict on claim {claim.id}: expected v{expected_version}"
                 )
+            self.conn.execute(
+                "UPDATE claims_fts SET entity_key = ? WHERE claim_id = ?",
+                (claim.entity_key, claim.id),
+            )
             if claim.status in (ClaimStatus.ACTIVE, ClaimStatus.CONTESTED):
                 row = self.conn.execute(
                     "SELECT vec FROM claim_vectors WHERE claim_id = ?", (claim.id,)
@@ -564,6 +568,24 @@ class ClaimRepository:
             )
 
         self._run_immediate_tx(_op)
+
+    def retry_or_fail_job(self, job_id: int, max_attempts: int = 3) -> str:
+        """Requeue job as PENDING if attempts < max_attempts, else mark FAILED."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        def _op() -> str:
+            row = self.conn.execute(
+                "SELECT attempts FROM async_jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            attempts = int(row["attempts"]) if row is not None else max_attempts
+            next_status = "PENDING" if attempts < max_attempts else "FAILED"
+            self.conn.execute(
+                "UPDATE async_jobs SET status = ?, updated_at = ? WHERE id = ?",
+                (next_status, now_iso, job_id),
+            )
+            return next_status
+
+        return self._run_immediate_tx(_op)
 
     def record_global_observation(
         self, signature: str, org_id: str, scrubbed_rule: str
