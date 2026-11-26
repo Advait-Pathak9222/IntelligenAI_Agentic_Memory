@@ -6,19 +6,19 @@ class D:
     def box(s,x,y,w,h,label,style):
         i=s.id(); s.cells.append(f'<mxCell id="{i}" value="{html.escape(label)}" style="{style}" vertex="1" parent="1"><mxGeometry x="{x}" y="{y}" width="{w}" height="{h}" as="geometry"/></mxCell>'); return i
     def edge(s,a,b,label="",style="",pts=None):
-        i=s.id(); base="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=1.5;strokeColor=#333333;endArrow=block;endFill=1;endSize=7;fontSize=14;fontFamily=Helvetica;fontColor=#333333;labelBackgroundColor=#ffffff;"
+        i=s.id(); base="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeWidth=1.5;strokeColor=#333333;endArrow=block;endFill=1;endSize=7;fontSize=14;fontFamily=Inter;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DInter;fontColor=#333333;labelBackgroundColor=#ffffff;"
         p=('<Array as="points">'+''.join(f'<mxPoint x="{x}" y="{y}"/>' for x,y in pts)+'</Array>') if pts else ''
         s.cells.append(f'<mxCell id="{i}" value="{html.escape(label)}" style="{base}{style}" edge="1" parent="1" source="{a}" target="{b}"><mxGeometry relative="1" as="geometry">{p}</mxGeometry></mxCell>'); return i
     def xml(s,name):
         return f'<mxfile host="drawio"><diagram name="{name}" id="{name}"><mxGraphModel grid="0" page="0" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/>{"".join(s.cells)}</root></mxGraphModel></diagram></mxfile>'
-F="html=1;whiteSpace=wrap;fontFamily=Helvetica;fontColor=#1a1a1a;"
+F="html=1;whiteSpace=wrap;fontFamily=Inter;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DInter;fontColor=#1a1a1a;"
 BOX=F+"rounded=0;fillColor=#ffffff;strokeColor=#333333;strokeWidth=1.5;fontSize=16;spacing=6;"
 LLM=F+"rounded=0;fillColor=#fbe9c6;strokeColor=#333333;strokeWidth=1.5;fontSize=16;spacing=6;"
 EXT=F+"rounded=0;fillColor=#ffffff;strokeColor=#333333;strokeWidth=1.5;dashed=1;dashPattern=6 4;fontSize=16;spacing=6;"
 STORE=F+"shape=cylinder;fillColor=#f2f2f2;strokeColor=#333333;strokeWidth=1.5;fontSize=16;"
 LANE=F+"rounded=0;fillColor=none;strokeColor=#9a9a9a;strokeWidth=1;verticalAlign=top;align=left;spacingLeft=10;spacingTop=4;fontSize=15;fontStyle=1;fontColor=#444444;"
-TXT="text;html=1;fillColor=none;strokeColor=none;fontFamily=Helvetica;fontColor=#333333;fontSize=14;align=left;verticalAlign=middle;whiteSpace=wrap;"
-def L(t,sub): return f"<b>{t}</b><br><span style='font-size:14px'>{sub}</span>"
+TXT="text;html=1;fillColor=none;strokeColor=none;fontFamily=Inter;fontSource=https%3A%2F%2Ffonts.googleapis.com%2Fcss%3Ffamily%3DInter;fontColor=#333333;fontSize=14;align=left;verticalAlign=middle;whiteSpace=wrap;"
+def L(t,sub): return f"<span style='font-weight:600'>{t}</span><br><span style='font-size:14px;color:#444444'>{sub}</span>"
 W=170; G=26; X0=20
 
 # ---- Figure 1 ----
@@ -26,7 +26,7 @@ d=D()
 d.box(0,0,800,250,"Critical path: 0 LLM calls, ≤150 ms p95",LANE)
 y=55; xs=[X0+i*(W+G) for i in range(4)]
 q=d.box(xs[0],y,W,80,L("Task queue","one org per task"),BOX)
-r=d.box(xs[1],y,W,80,L("Recall","hybrid search, ≤4k tokens"),BOX)
+r=d.box(xs[1],y,W,80,L("Recall","hybrid, ≤4k tokens"),BOX)
 a=d.box(xs[2],y,W,80,L("Agent run","black-box LLM + tools"),BOX)
 w=d.box(xs[3],y,W,80,L("Write staging","≤3 cited claims"),BOX)
 d.edge(q,r); d.edge(r,a); d.edge(a,w)
@@ -43,7 +43,7 @@ s2=d.box(xs[1],ys,W,80,L("Conflict review","5 pairs per LLM call"),LLM)
 s3=d.box(xs[2],ys,W,80,L("Rollback","1 LLM call per flag"),LLM)
 s4=d.box(xs[3],ys,W,80,L("Sharing and decay","nightly"),LLM)
 d.edge(s1,s2); d.edge(s2,s3); d.edge(s3,s4)
-hf=d.box(xs[2],560,W,56,L("Human feedback","2% of outputs, days later"),EXT)
+hf=d.box(xs[2],556,W,62,L("Human feedback","2% of outputs, delayed"),EXT)
 d.edge(hf,s3)
 d.box(0,655,30,20,"",LLM); d.box(38,653,280,24,"Step that calls an LLM",TXT)
 d.box(300,655,30,20,"",EXT); d.box(338,653,300,24,"Input from outside the memory layer",TXT)
