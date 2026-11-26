@@ -4,7 +4,7 @@ const puppeteer=require('puppeteer-core');const fs=require('fs');const path=requ
  const b=await puppeteer.launch({executablePath:'/usr/bin/google-chrome',args:['--no-sandbox']});
  for(const f of process.argv.slice(2)){
   const xml=fs.readFileSync(f,'utf8');
-  const p=await b.newPage(); await p.setViewport({width:1700,height:1200,deviceScaleFactor:2});
+  const p=await b.newPage(); await p.setViewport({width:1700,height:1200,deviceScaleFactor:3});
   await p.setContent(`<html><body style="margin:0;background:#fff"><div id="g" style="position:absolute;left:0;top:0;"></div><script>window.mxLoadResources=false;window.mxLoadStylesheets=false;window.mxBasePath='.';</script></body></html>`);
   await p.addScriptTag({content:mx});
   const box=await p.evaluate((xml)=>{
@@ -15,7 +15,7 @@ const puppeteer=require('puppeteer-core');const fs=require('fs');const path=requ
    const c=document.getElementById('g');c.style.width=(bb.width+40)+'px';c.style.height=(bb.height+40)+'px';
    return {w:Math.ceil(bb.width+40),h:Math.ceil(bb.height+40)};
   },xml);
-  await p.setViewport({width:box.w,height:box.h,deviceScaleFactor:2});
+  await p.setViewport({width:box.w,height:box.h,deviceScaleFactor:3});
   await p.screenshot({path:f.replace(/\.drawio$/,'.png'),clip:{x:0,y:0,width:box.w,height:box.h}});
   console.log(f,box);
  }
