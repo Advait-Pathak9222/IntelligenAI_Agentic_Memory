@@ -1,8 +1,10 @@
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
-ROOT = Path("/Users/advaitpathak/Desktop/Placement Assignments/Intelligen-AI")
+ROOT = Path(__file__).resolve().parent.parent
 BUILD_DIR = ROOT / "build"
 BUILD_DIR.mkdir(exist_ok=True)
 
@@ -415,7 +417,21 @@ if __name__ == "__main__":
     assert total <= 1200, f"Word limit exceeded: {total} > 1200"
     html_path = build_html()
     pdf_path = ROOT / "Agentic_Memory_Architecture_Submission.pdf"
-    chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    chrome = os.environ.get("CHROME_BIN") or next(
+        (
+            c
+            for c in (
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                shutil.which("google-chrome"),
+                shutil.which("chromium"),
+                shutil.which("chromium-browser"),
+            )
+            if c and Path(c).exists()
+        ),
+        None,
+    )
+    if chrome is None:
+        raise SystemExit("Chrome/Chromium not found; set CHROME_BIN to its path.")
     cmd = [
         chrome,
         "--headless",
